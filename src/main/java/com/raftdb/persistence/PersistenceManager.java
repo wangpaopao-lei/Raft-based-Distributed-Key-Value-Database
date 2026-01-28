@@ -215,6 +215,32 @@ public class PersistenceManager {
         logger.info("Truncated log from index {}", fromIndex);
     }
 
+    /**
+     * Rewrite the log file with the given entries.
+     * Used for log compaction after snapshot.
+     */
+    public void rewriteLog(List<LogEntry> entries) throws IOException {
+        synchronized (logRaf) {
+            logRaf.close();
+
+            // Rewrite the file
+            try (DataOutputStream dos = new DataOutputStream(
+                    new BufferedOutputStream(Files.newOutputStream(logFile)))) {
+
+                for (LogEntry entry : entries) {
+                    byte[] data = serializeEntry(entry);
+                    dos.writeInt(data.length);
+                    dos.write(data);
+                }
+            }
+
+            // Reopen for appending
+            logRaf = new RandomAccessFile(logFile.toFile(), "rw");
+        }
+
+        logger.info("Rewrote log with {} entries", entries.size());
+    }
+
     // ==================== Serialization ====================
 
     private byte[] serializeEntry(LogEntry entry) {

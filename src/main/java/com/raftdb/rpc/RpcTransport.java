@@ -3,6 +3,8 @@ package com.raftdb.rpc;
 import com.raftdb.core.NodeId;
 import com.raftdb.rpc.proto.AppendEntriesRequest;
 import com.raftdb.rpc.proto.AppendEntriesResponse;
+import com.raftdb.rpc.proto.InstallSnapshotRequest;
+import com.raftdb.rpc.proto.InstallSnapshotResponse;
 import com.raftdb.rpc.proto.VoteRequest;
 import com.raftdb.rpc.proto.VoteResponse;
 
@@ -26,6 +28,11 @@ public interface RpcTransport {
      * Send an append entries request (log replication or heartbeat) to a target node.
      */
     CompletableFuture<AppendEntriesResponse> sendAppendEntries(NodeId target, AppendEntriesRequest request);
+
+    /**
+     * Send an install snapshot request to a target node.
+     */
+    CompletableFuture<InstallSnapshotResponse> sendInstallSnapshot(NodeId target, InstallSnapshotRequest request);
 
     /**
      * Start the transport, begin listening for incoming requests.

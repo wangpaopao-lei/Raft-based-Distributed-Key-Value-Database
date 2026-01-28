@@ -2,6 +2,8 @@ package com.raftdb.rpc;
 
 import com.raftdb.rpc.proto.AppendEntriesRequest;
 import com.raftdb.rpc.proto.AppendEntriesResponse;
+import com.raftdb.rpc.proto.InstallSnapshotRequest;
+import com.raftdb.rpc.proto.InstallSnapshotResponse;
 import com.raftdb.rpc.proto.VoteRequest;
 import com.raftdb.rpc.proto.VoteResponse;
 
@@ -21,4 +23,9 @@ public interface RpcHandler {
      * Also used for heartbeats (when entries is empty).
      */
     AppendEntriesResponse handleAppendEntries(AppendEntriesRequest request);
+
+    /**
+     * Handle an incoming install snapshot request from the leader.
+     */
+    InstallSnapshotResponse handleInstallSnapshot(InstallSnapshotRequest request);
 }

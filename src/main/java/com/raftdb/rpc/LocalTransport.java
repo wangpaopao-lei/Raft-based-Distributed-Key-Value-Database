@@ -3,6 +3,8 @@ package com.raftdb.rpc;
 import com.raftdb.core.NodeId;
 import com.raftdb.rpc.proto.AppendEntriesRequest;
 import com.raftdb.rpc.proto.AppendEntriesResponse;
+import com.raftdb.rpc.proto.InstallSnapshotRequest;
+import com.raftdb.rpc.proto.InstallSnapshotResponse;
 import com.raftdb.rpc.proto.VoteRequest;
 import com.raftdb.rpc.proto.VoteResponse;
 import org.slf4j.Logger;
@@ -86,6 +88,27 @@ public class LocalTransport implements RpcTransport {
             }
 
             AppendEntriesResponse response = handler.handleAppendEntries(request);
+
+            return response;
+        }, executor);
+    }
+
+    @Override
+    public CompletableFuture<InstallSnapshotResponse> sendInstallSnapshot(NodeId target, InstallSnapshotRequest request) {
+        return CompletableFuture.supplyAsync(() -> {
+            simulateNetworkDelay();
+
+            RpcHandler handler = REGISTRY.get(target);
+            if (handler == null) {
+                throw new RuntimeException("Node not found: " + target);
+            }
+
+            logger.debug("{} -> {} InstallSnapshot(term={}, lastIndex={}, size={})",
+                    selfId, target, request.getTerm(), request.getLastIncludedIndex(),
+                    request.getData().size());
+
+            InstallSnapshotResponse response = handler.handleInstallSnapshot(request);
+            logger.debug("{} <- {} InstallSnapshotResponse(term={})", selfId, target, response.getTerm());
 
             return response;
         }, executor);

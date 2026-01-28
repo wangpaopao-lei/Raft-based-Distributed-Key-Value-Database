@@ -4,7 +4,9 @@ import com.raftdb.rpc.proto.OperationType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.*;
 import java.util.Arrays;
+import java.util.Map;
 import java.util.concurrent.ConcurrentSkipListMap;
 
 /**
@@ -74,6 +76,73 @@ public class SkipListKVStore implements StateMachine {
      */
     public void clear() {
         store.clear();
+    }
+
+    /**
+     * Take a snapshot of current state.
+     * Format: [numEntries][keyLen][key][valueLen][value]...
+     */
+    @Override
+    public byte[] takeSnapshot() {
+        try (ByteArrayOutputStream baos = new ByteArrayOutputStream();
+             DataOutputStream dos = new DataOutputStream(baos)) {
+
+            dos.writeInt(store.size());
+
+            for (Map.Entry<ByteArrayWrapper, byte[]> entry : store.entrySet()) {
+                byte[] key = entry.getKey().data;
+                byte[] value = entry.getValue();
+
+                dos.writeInt(key.length);
+                dos.write(key);
+                dos.writeInt(value.length);
+                dos.write(value);
+            }
+
+            dos.flush();
+            byte[] snapshot = baos.toByteArray();
+            logger.debug("Created snapshot with {} entries, {} bytes", store.size(), snapshot.length);
+            return snapshot;
+
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to create snapshot", e);
+        }
+    }
+
+    /**
+     * Restore state from a snapshot.
+     */
+    @Override
+    public void restoreSnapshot(byte[] data) {
+        store.clear();
+
+        if (data == null || data.length == 0) {
+            logger.debug("Restored empty snapshot");
+            return;
+        }
+
+        try (ByteArrayInputStream bais = new ByteArrayInputStream(data);
+             DataInputStream dis = new DataInputStream(bais)) {
+
+            int numEntries = dis.readInt();
+
+            for (int i = 0; i < numEntries; i++) {
+                int keyLen = dis.readInt();
+                byte[] key = new byte[keyLen];
+                dis.readFully(key);
+
+                int valueLen = dis.readInt();
+                byte[] value = new byte[valueLen];
+                dis.readFully(value);
+
+                store.put(new ByteArrayWrapper(key), value);
+            }
+
+            logger.debug("Restored snapshot with {} entries", numEntries);
+
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to restore snapshot", e);
+        }
     }
 
     /**

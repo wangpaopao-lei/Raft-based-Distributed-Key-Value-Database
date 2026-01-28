@@ -16,6 +16,7 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
  *
  * Thread-safe implementation using read-write locks.
  * Supports optional persistence via PersistenceManager.
+ * Supports log compaction via snapshots.
  */
 public class LogManager {
 
@@ -28,6 +29,10 @@ public class LogManager {
 
     // Optional persistence
     private PersistenceManager persistence;
+
+    // Snapshot info: all entries up to and including snapshotIndex have been compacted
+    private volatile long snapshotIndex = 0;
+    private volatile long snapshotTerm = 0;
 
     public LogManager() {
         // Add dummy entry at index 0 to make log 1-indexed
@@ -54,12 +59,59 @@ public class LogManager {
     }
 
     /**
+     * Set snapshot info after loading/installing a snapshot.
+     * Also clears any log entries before or at the snapshot index.
+     */
+    public void setSnapshot(long index, long term) {
+        lock.writeLock().lock();
+        try {
+            this.snapshotIndex = index;
+            this.snapshotTerm = term;
+
+            // Remove entries that are covered by the snapshot
+            // Keep only entries after snapshotIndex
+            if (!entries.isEmpty()) {
+                int removeUpTo = (int) (index - getLogOffset());
+                if (removeUpTo > 0 && removeUpTo < entries.size()) {
+                    // Keep entries after snapshot
+                    List<LogEntry> remaining = new ArrayList<>(entries.subList(removeUpTo + 1, entries.size()));
+                    entries.clear();
+                    entries.add(null); // dummy at index 0
+                    entries.addAll(remaining);
+                } else if (removeUpTo >= entries.size() - 1) {
+                    // Snapshot covers all entries
+                    entries.clear();
+                    entries.add(null);
+                }
+            }
+
+            logger.info("Set snapshot info: index={}, term={}", index, term);
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * Get the log offset (entries before this are compacted into snapshot).
+     */
+    private long getLogOffset() {
+        return snapshotIndex;
+    }
+
+    /**
+     * Convert absolute log index to internal list index.
+     */
+    private int toInternalIndex(long absoluteIndex) {
+        return (int) (absoluteIndex - snapshotIndex);
+    }
+
+    /**
      * Get the last log index (0 if log is empty).
      */
     public long getLastIndex() {
         lock.readLock().lock();
         try {
-            return entries.size() - 1;
+            return snapshotIndex + entries.size() - 1;
         } finally {
             lock.readLock().unlock();
         }
@@ -72,7 +124,7 @@ public class LogManager {
         lock.readLock().lock();
         try {
             if (entries.size() <= 1) {
-                return 0;
+                return snapshotTerm;
             }
             return entries.get(entries.size() - 1).term();
         } finally {
@@ -86,25 +138,40 @@ public class LogManager {
     public long getTerm(long index) {
         lock.readLock().lock();
         try {
-            if (index <= 0 || index >= entries.size()) {
+            if (index <= 0) {
                 return 0;
             }
-            return entries.get((int) index).term();
+            if (index == snapshotIndex) {
+                return snapshotTerm;
+            }
+            if (index < snapshotIndex) {
+                // Entry is compacted, we don't have it
+                return 0;
+            }
+            int internalIndex = toInternalIndex(index);
+            if (internalIndex <= 0 || internalIndex >= entries.size()) {
+                return 0;
+            }
+            return entries.get(internalIndex).term();
         } finally {
             lock.readLock().unlock();
         }
     }
 
     /**
-     * Get entry at a specific index (null if out of bounds).
+     * Get entry at a specific index (null if out of bounds or compacted).
      */
     public LogEntry getEntry(long index) {
         lock.readLock().lock();
         try {
-            if (index <= 0 || index >= entries.size()) {
+            if (index <= snapshotIndex) {
+                return null; // Compacted
+            }
+            int internalIndex = toInternalIndex(index);
+            if (internalIndex <= 0 || internalIndex >= entries.size()) {
                 return null;
             }
-            return entries.get((int) index);
+            return entries.get(internalIndex);
         } finally {
             lock.readLock().unlock();
         }
@@ -116,11 +183,22 @@ public class LogManager {
     public List<LogEntry> getEntriesFrom(long startIndex) {
         lock.readLock().lock();
         try {
-            if (startIndex >= entries.size()) {
+            long lastIdx = getLastIndex();
+            if (startIndex > lastIdx) {
                 return Collections.emptyList();
             }
-            int start = Math.max(1, (int) startIndex);
-            return new ArrayList<>(entries.subList(start, entries.size()));
+            // If startIndex is compacted, we can't provide those entries
+            if (startIndex <= snapshotIndex) {
+                startIndex = snapshotIndex + 1;
+            }
+            int internalStart = toInternalIndex(startIndex);
+            if (internalStart < 1) {
+                internalStart = 1;
+            }
+            if (internalStart >= entries.size()) {
+                return Collections.emptyList();
+            }
+            return new ArrayList<>(entries.subList(internalStart, entries.size()));
         } finally {
             lock.readLock().unlock();
         }
@@ -132,15 +210,52 @@ public class LogManager {
     public List<LogEntry> getEntries(long startIndex, long endIndex) {
         lock.readLock().lock();
         try {
-            int start = Math.max(1, (int) startIndex);
-            int end = Math.min(entries.size(), (int) endIndex + 1);
-            if (start >= end) {
+            if (startIndex <= snapshotIndex) {
+                startIndex = snapshotIndex + 1;
+            }
+            int internalStart = toInternalIndex(startIndex);
+            int internalEnd = toInternalIndex(endIndex) + 1;
+
+            internalStart = Math.max(1, internalStart);
+            internalEnd = Math.min(entries.size(), internalEnd);
+
+            if (internalStart >= internalEnd) {
                 return Collections.emptyList();
             }
-            return new ArrayList<>(entries.subList(start, end));
+            return new ArrayList<>(entries.subList(internalStart, internalEnd));
         } finally {
             lock.readLock().unlock();
         }
+    }
+
+    /**
+     * Check if the log contains an entry at the given index (not compacted).
+     */
+    public boolean containsEntry(long index) {
+        lock.readLock().lock();
+        try {
+            if (index <= snapshotIndex) {
+                return false;
+            }
+            int internalIndex = toInternalIndex(index);
+            return internalIndex > 0 && internalIndex < entries.size();
+        } finally {
+            lock.readLock().unlock();
+        }
+    }
+
+    /**
+     * Get the snapshot index.
+     */
+    public long getSnapshotIndex() {
+        return snapshotIndex;
+    }
+
+    /**
+     * Get the snapshot term.
+     */
+    public long getSnapshotTerm() {
+        return snapshotTerm;
     }
 
     /**
@@ -151,7 +266,7 @@ public class LogManager {
     public long append(long term, byte[] command) {
         lock.writeLock().lock();
         try {
-            long index = entries.size();
+            long index = snapshotIndex + entries.size();
             LogEntry entry = LogEntry.of(index, term, command);
             entries.add(entry);
 
@@ -185,14 +300,27 @@ public class LogManager {
         try {
             // Check if log contains prevLogIndex with matching term
             if (prevLogIndex > 0) {
-                if (prevLogIndex >= entries.size()) {
-                    logger.debug("Log doesn't contain prevLogIndex {}", prevLogIndex);
-                    return false;
-                }
-                long termAtPrev = entries.get((int) prevLogIndex).term();
-                if (termAtPrev != prevLogTerm) {
-                    logger.debug("Term mismatch at index {}: {} != {}", prevLogIndex, termAtPrev, prevLogTerm);
-                    return false;
+                // If prevLogIndex is at snapshot boundary, check snapshotTerm
+                if (prevLogIndex == snapshotIndex) {
+                    if (snapshotTerm != prevLogTerm) {
+                        logger.debug("Term mismatch at snapshot index {}: {} != {}",
+                                prevLogIndex, snapshotTerm, prevLogTerm);
+                        return false;
+                    }
+                } else if (prevLogIndex < snapshotIndex) {
+                    // Entry is compacted, assume it matches (leader wouldn't send otherwise)
+                    // This is ok because snapshot installation guarantees consistency
+                } else {
+                    int internalPrev = toInternalIndex(prevLogIndex);
+                    if (internalPrev >= entries.size()) {
+                        logger.debug("Log doesn't contain prevLogIndex {}", prevLogIndex);
+                        return false;
+                    }
+                    long termAtPrev = entries.get(internalPrev).term();
+                    if (termAtPrev != prevLogTerm) {
+                        logger.debug("Term mismatch at index {}: {} != {}", prevLogIndex, termAtPrev, prevLogTerm);
+                        return false;
+                    }
                 }
             }
 
@@ -204,8 +332,10 @@ public class LogManager {
             boolean truncated = false;
 
             for (LogEntry newEntry : newEntries) {
-                if (insertIndex < entries.size()) {
-                    LogEntry existing = entries.get((int) insertIndex);
+                int internalInsert = toInternalIndex(insertIndex);
+
+                if (internalInsert > 0 && internalInsert < entries.size()) {
+                    LogEntry existing = entries.get(internalInsert);
                     if (existing.term() != newEntry.term()) {
                         // Conflict: truncate from here
                         logger.info("Conflict at index {}, truncating", insertIndex);
@@ -215,11 +345,12 @@ public class LogManager {
                         entriesToPersist.add(newEntry);
                     }
                     // If terms match, entry is already there, skip
-                } else {
+                } else if (internalInsert >= entries.size()) {
                     // New entry beyond current log
                     entries.add(newEntry);
                     entriesToPersist.add(newEntry);
                 }
+                // If internalInsert <= 0, entry is covered by snapshot, skip
                 insertIndex++;
             }
 
@@ -272,16 +403,93 @@ public class LogManager {
     }
 
     private void truncateFromInternal(long fromIndex) {
-        if (fromIndex >= entries.size()) {
+        if (fromIndex <= snapshotIndex) {
+            // Can't truncate compacted entries
             return;
         }
-        int from = Math.max(1, (int) fromIndex);
-        logger.info("Truncating log from index {}", from);
-        entries.subList(from, entries.size()).clear();
+        int internalFrom = toInternalIndex(fromIndex);
+        if (internalFrom >= entries.size()) {
+            return;
+        }
+        internalFrom = Math.max(1, internalFrom);
+        logger.info("Truncating log from index {} (internal {})", fromIndex, internalFrom);
+        entries.subList(internalFrom, entries.size()).clear();
     }
 
     /**
-     * Get the size of the log (number of entries, excluding dummy at index 0).
+     * Compact log up to the given index (for snapshot).
+     * Removes entries from 1 to compactIndex (inclusive).
+     */
+    public void compactTo(long compactIndex, long compactTerm) {
+        lock.writeLock().lock();
+        try {
+            if (compactIndex <= snapshotIndex) {
+                logger.debug("Nothing to compact, compactIndex {} <= snapshotIndex {}",
+                        compactIndex, snapshotIndex);
+                return;
+            }
+
+            int internalCompact = toInternalIndex(compactIndex);
+            if (internalCompact <= 0 || internalCompact >= entries.size()) {
+                logger.warn("Invalid compact index {}", compactIndex);
+                return;
+            }
+
+            // Keep entries after compactIndex
+            List<LogEntry> remaining = new ArrayList<>(
+                    entries.subList(internalCompact + 1, entries.size()));
+
+            entries.clear();
+            entries.add(null); // dummy
+            entries.addAll(remaining);
+
+            snapshotIndex = compactIndex;
+            snapshotTerm = compactTerm;
+
+            logger.info("Compacted log to index {}, {} entries remaining", compactIndex, remaining.size());
+
+            // Persist remaining entries (rewrite log file)
+            if (persistence != null) {
+                try {
+                    persistence.rewriteLog(remaining);
+                } catch (IOException e) {
+                    throw new RuntimeException("Failed to persist log compaction", e);
+                }
+            }
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * Reset log after installing a snapshot.
+     * Clears all entries and sets new snapshot baseline.
+     */
+    public void resetToSnapshot(long index, long term) {
+        lock.writeLock().lock();
+        try {
+            entries.clear();
+            entries.add(null); // dummy
+            snapshotIndex = index;
+            snapshotTerm = term;
+
+            logger.info("Reset log to snapshot: index={}, term={}", index, term);
+
+            // Clear persisted log
+            if (persistence != null) {
+                try {
+                    persistence.rewriteLog(Collections.emptyList());
+                } catch (IOException e) {
+                    throw new RuntimeException("Failed to clear persisted log", e);
+                }
+            }
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * Get the size of the log (number of entries, excluding compacted).
      */
     public int size() {
         lock.readLock().lock();

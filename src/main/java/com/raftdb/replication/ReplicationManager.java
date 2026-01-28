@@ -7,14 +7,18 @@ import com.raftdb.log.LogManager;
 import com.raftdb.rpc.RpcTransport;
 import com.raftdb.rpc.proto.AppendEntriesRequest;
 import com.raftdb.rpc.proto.AppendEntriesResponse;
+import com.raftdb.rpc.proto.InstallSnapshotRequest;
+import com.raftdb.rpc.proto.InstallSnapshotResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.*;
 import java.util.function.Consumer;
+import java.util.function.Function;
 
 /**
  * Manages log replication from leader to followers.
@@ -39,11 +43,17 @@ public class ReplicationManager {
     private final Map<NodeId, Long> nextIndex = new ConcurrentHashMap<>();
     private final Map<NodeId, Long> matchIndex = new ConcurrentHashMap<>();
 
+    // Peers currently receiving a snapshot (to avoid sending multiple snapshots concurrently)
+    private final Set<NodeId> snapshotInProgress = ConcurrentHashMap.newKeySet();
+
     private final ScheduledExecutorService scheduler;
     private ScheduledFuture<?> replicationTask;
 
     private Consumer<Long> onHigherTermDiscovered;
     private Runnable onCommitAdvanced;
+
+    // Snapshot provider: returns InstallSnapshotRequest for a peer, or null if no snapshot available
+    private Function<NodeId, InstallSnapshotRequest> snapshotProvider;
 
     public ReplicationManager(
             NodeId selfId,
@@ -69,6 +79,10 @@ public class ReplicationManager {
 
     public void setOnCommitAdvanced(Runnable callback) {
         this.onCommitAdvanced = callback;
+    }
+
+    public void setSnapshotProvider(Function<NodeId, InstallSnapshotRequest> provider) {
+        this.snapshotProvider = provider;
     }
 
     /**
@@ -146,6 +160,14 @@ public class ReplicationManager {
 
     private void replicateTo(NodeId peer) {
         long peerNextIndex = nextIndex.getOrDefault(peer, 1L);
+        long snapshotIndex = logManager.getSnapshotIndex();
+
+        // If peer needs entries that have been compacted, send snapshot instead
+        if (peerNextIndex <= snapshotIndex && snapshotProvider != null) {
+            sendSnapshotTo(peer);
+            return;
+        }
+
         long prevLogIndex = peerNextIndex - 1;
         long prevLogTerm = logManager.getTerm(prevLogIndex);
 
@@ -177,6 +199,64 @@ public class ReplicationManager {
                     logger.trace("Replication to {} failed: {}", peer, e.getMessage());
                     return null;
                 });
+    }
+
+    /**
+     * Send a snapshot to a follower that is too far behind.
+     */
+    private void sendSnapshotTo(NodeId peer) {
+        // Avoid sending multiple snapshots to the same peer concurrently
+        if (!snapshotInProgress.add(peer)) {
+            return;
+        }
+
+        InstallSnapshotRequest request = snapshotProvider.apply(peer);
+        if (request == null) {
+            snapshotInProgress.remove(peer);
+            return;
+        }
+
+        logger.info("Sending snapshot to {} (lastIndex={}, size={})",
+                peer, request.getLastIncludedIndex(), request.getData().size());
+
+        transport.sendInstallSnapshot(peer, request)
+                .thenAccept(response -> handleSnapshotResponse(peer, request, response))
+                .exceptionally(e -> {
+                    logger.warn("Snapshot to {} failed: {}", peer, e.getMessage());
+                    snapshotInProgress.remove(peer);
+                    return null;
+                });
+    }
+
+    /**
+     * Handle InstallSnapshot response.
+     */
+    private void handleSnapshotResponse(NodeId peer, InstallSnapshotRequest request, InstallSnapshotResponse response) {
+        MDC.put("nodeId", selfId.toString());
+        snapshotInProgress.remove(peer);
+
+        // Check for higher term
+        if (response.getTerm() > state.getCurrentTerm()) {
+            logger.info("Discovered higher term {} from {}", response.getTerm(), peer);
+            if (onHigherTermDiscovered != null) {
+                onHigherTermDiscovered.accept(response.getTerm());
+            }
+            return;
+        }
+
+        if (!state.isLeader()) {
+            return;
+        }
+
+        // Snapshot accepted, update nextIndex and matchIndex
+        long snapshotLastIndex = request.getLastIncludedIndex();
+        nextIndex.put(peer, snapshotLastIndex + 1);
+        matchIndex.put(peer, snapshotLastIndex);
+
+        logger.info("Snapshot to {} complete, nextIndex={}", peer, snapshotLastIndex + 1);
+
+        // Try to advance commit index
+        tryAdvanceCommitIndex();
     }
 
     private void handleResponse(NodeId peer, AppendEntriesRequest request, AppendEntriesResponse response) {

@@ -9,11 +9,15 @@ import com.raftdb.rpc.RpcHandler;
 import com.raftdb.rpc.RpcTransport;
 import com.raftdb.rpc.proto.AppendEntriesRequest;
 import com.raftdb.rpc.proto.AppendEntriesResponse;
+import com.raftdb.rpc.proto.InstallSnapshotRequest;
+import com.raftdb.rpc.proto.InstallSnapshotResponse;
 import com.raftdb.rpc.proto.VoteRequest;
 import com.raftdb.rpc.proto.VoteResponse;
+import com.raftdb.snapshot.SnapshotManager;
 import com.raftdb.statemachine.Command;
 import com.raftdb.statemachine.SkipListKVStore;
 import com.raftdb.statemachine.StateMachine;
+import com.google.protobuf.ByteString;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
@@ -34,6 +38,9 @@ public class RaftNode implements RpcHandler {
 
     private static final Logger logger = LoggerFactory.getLogger(RaftNode.class);
 
+    // Snapshot threshold: take snapshot when log exceeds this many entries
+    private static final int SNAPSHOT_THRESHOLD = 1000;
+
     private final NodeId id;
     private final RaftState state;
     private final LogManager logManager;
@@ -46,14 +53,23 @@ public class RaftNode implements RpcHandler {
     // Optional persistence
     private final PersistenceManager persistence;
 
+    // Optional snapshot manager
+    private SnapshotManager snapshotManager;
+
     // Pending client requests waiting for commit
     private final Map<Long, CompletableFuture<byte[]>> pendingRequests = new ConcurrentHashMap<>();
 
     // Lock for log append operations
     private final ReentrantLock appendLock = new ReentrantLock();
 
+    // Lock for snapshot operations
+    private final ReentrantLock snapshotLock = new ReentrantLock();
+
     // Executor for applying committed entries
     private final ExecutorService applyExecutor;
+
+    // Data directory for persistence
+    private final Path dataDir;
 
     /**
      * Create a RaftNode without persistence (for testing).
@@ -71,6 +87,7 @@ public class RaftNode implements RpcHandler {
         this.id = id;
         this.peers = peers;
         this.transport = transport;
+        this.dataDir = dataDir;
         this.state = new RaftState();
         this.logManager = new LogManager();
         this.stateMachine = new SkipListKVStore();
@@ -99,6 +116,9 @@ public class RaftNode implements RpcHandler {
                 peers
         );
 
+        // Setup snapshot callback for replication manager
+        this.replicationManager.setSnapshotProvider(this::getSnapshotForReplication);
+
         this.applyExecutor = Executors.newSingleThreadExecutor(r -> {
             Thread t = new Thread(r, "apply-" + id);
             t.setDaemon(true);
@@ -124,6 +144,9 @@ public class RaftNode implements RpcHandler {
             try {
                 persistence.init();
 
+                // Initialize snapshot manager
+                snapshotManager = new SnapshotManager(dataDir);
+
                 // Recover term and votedFor
                 state.restore(persistence.getCurrentTerm(), persistence.getVotedFor());
 
@@ -137,10 +160,24 @@ public class RaftNode implements RpcHandler {
                     }
                 });
 
+                // Recover from snapshot first
+                if (snapshotManager.hasSnapshot()) {
+                    byte[] snapshotData = snapshotManager.loadSnapshot();
+                    long snapshotIndex = snapshotManager.getLastIncludedIndex();
+                    long snapshotTerm = snapshotManager.getLastIncludedTerm();
+
+                    stateMachine.restoreSnapshot(snapshotData);
+                    logManager.setSnapshot(snapshotIndex, snapshotTerm);
+                    state.setCommitIndex(snapshotIndex);
+                    state.setLastApplied(snapshotIndex);
+
+                    logger.info("Restored from snapshot: index={}, term={}", snapshotIndex, snapshotTerm);
+                }
+
                 // Recover log
                 logManager.setPersistence(persistence);
 
-                // Replay log to recover state machine
+                // Replay log to recover state machine (entries after snapshot)
                 replayLog();
 
                 logger.info("Recovered state: term={}, votedFor={}, lastLogIndex={}",
@@ -159,16 +196,20 @@ public class RaftNode implements RpcHandler {
 
     /**
      * Replay committed log entries to recover state machine.
+     * Starts from snapshot index + 1 (entries after snapshot).
      */
     private void replayLog() {
+        long snapshotIndex = logManager.getSnapshotIndex();
         long lastIndex = logManager.getLastIndex();
-        if (lastIndex == 0) {
+
+        if (lastIndex <= snapshotIndex) {
             return;
         }
 
-        logger.info("Replaying {} log entries to recover state machine", lastIndex);
+        long startIndex = snapshotIndex + 1;
+        logger.info("Replaying log entries {} to {} to recover state machine", startIndex, lastIndex);
 
-        for (long i = 1; i <= lastIndex; i++) {
+        for (long i = startIndex; i <= lastIndex; i++) {
             LogEntry entry = logManager.getEntry(i);
             if (entry != null && entry.command().length > 0) {
                 Command command = Command.fromBytes(entry.command());
@@ -199,6 +240,11 @@ public class RaftNode implements RpcHandler {
         // Close persistence
         if (persistence != null) {
             persistence.close();
+        }
+
+        // Close snapshot manager
+        if (snapshotManager != null) {
+            snapshotManager.close();
         }
 
         // Fail all pending requests
@@ -320,7 +366,139 @@ public class RaftNode implements RpcHandler {
 
                 state.setLastApplied(lastApplied);
             }
+
+            // Check if we should take a snapshot
+            maybeSnapshot();
         });
+    }
+
+    // ==================== Snapshot Operations ====================
+
+    /**
+     * Check if we should take a snapshot based on log size.
+     */
+    private void maybeSnapshot() {
+        if (snapshotManager == null) {
+            return;
+        }
+
+        int logSize = logManager.size();
+        if (logSize >= SNAPSHOT_THRESHOLD) {
+            try {
+                takeSnapshot();
+            } catch (IOException e) {
+                logger.error("Failed to take snapshot", e);
+            }
+        }
+    }
+
+    /**
+     * Take a snapshot at the current commit index.
+     */
+    public void takeSnapshot() throws IOException {
+        snapshotLock.lock();
+        try {
+            if (snapshotManager == null) {
+                throw new IllegalStateException("Snapshot not enabled (no data directory)");
+            }
+
+            long snapshotIndex = state.getLastApplied();
+            if (snapshotIndex <= logManager.getSnapshotIndex()) {
+                logger.debug("No new entries to snapshot");
+                return;
+            }
+
+            long snapshotTerm = logManager.getTerm(snapshotIndex);
+            if (snapshotTerm == 0) {
+                // Entry might be compacted, use snapshot term
+                snapshotTerm = logManager.getSnapshotTerm();
+            }
+
+            logger.info("Taking snapshot at index {}, term {}", snapshotIndex, snapshotTerm);
+
+            // Serialize state machine
+            byte[] snapshotData = stateMachine.takeSnapshot();
+
+            // Save snapshot
+            snapshotManager.saveSnapshot(snapshotData, snapshotIndex, snapshotTerm);
+
+            // Compact log
+            logManager.compactTo(snapshotIndex, snapshotTerm);
+
+            logger.info("Snapshot complete: {} bytes, {} log entries remaining",
+                    snapshotData.length, logManager.size());
+
+        } finally {
+            snapshotLock.unlock();
+        }
+    }
+
+    /**
+     * Manually trigger a snapshot (for testing or admin).
+     */
+    public void triggerSnapshot() throws IOException {
+        takeSnapshot();
+    }
+
+    /**
+     * Get snapshot data for replication to a follower.
+     * Called by ReplicationManager when follower is too far behind.
+     */
+    private InstallSnapshotRequest getSnapshotForReplication(NodeId target) {
+        if (snapshotManager == null || !snapshotManager.hasSnapshot()) {
+            return null;
+        }
+
+        try {
+            byte[] data = snapshotManager.loadSnapshot();
+            return InstallSnapshotRequest.newBuilder()
+                    .setTerm(state.getCurrentTerm())
+                    .setLeaderId(id.toString())
+                    .setLastIncludedIndex(snapshotManager.getLastIncludedIndex())
+                    .setLastIncludedTerm(snapshotManager.getLastIncludedTerm())
+                    .setOffset(0)
+                    .setData(ByteString.copyFrom(data))
+                    .setDone(true)  // For simplicity, send entire snapshot at once
+                    .build();
+        } catch (IOException e) {
+            logger.error("Failed to load snapshot for replication", e);
+            return null;
+        }
+    }
+
+    /**
+     * Install a snapshot received from the leader.
+     */
+    private void installSnapshot(long lastIncludedIndex, long lastIncludedTerm, byte[] data) throws IOException {
+        snapshotLock.lock();
+        try {
+            logger.info("Installing snapshot: lastIndex={}, lastTerm={}, size={}",
+                    lastIncludedIndex, lastIncludedTerm, data.length);
+
+            // Save snapshot to disk
+            if (snapshotManager != null) {
+                snapshotManager.saveSnapshot(data, lastIncludedIndex, lastIncludedTerm);
+            }
+
+            // Restore state machine from snapshot
+            stateMachine.restoreSnapshot(data);
+
+            // Reset log
+            logManager.resetToSnapshot(lastIncludedIndex, lastIncludedTerm);
+
+            // Update state
+            if (lastIncludedIndex > state.getCommitIndex()) {
+                state.setCommitIndex(lastIncludedIndex);
+            }
+            if (lastIncludedIndex > state.getLastApplied()) {
+                state.setLastApplied(lastIncludedIndex);
+            }
+
+            logger.info("Snapshot installed successfully");
+
+        } finally {
+            snapshotLock.unlock();
+        }
     }
 
     // ==================== RpcHandler Implementation ====================
@@ -423,6 +601,49 @@ public class RaftNode implements RpcHandler {
                 .setTerm(currentTerm)
                 .setSuccess(true)
                 .setMatchIndex(logManager.getLastIndex())
+                .build();
+    }
+
+    @Override
+    public InstallSnapshotResponse handleInstallSnapshot(InstallSnapshotRequest request) {
+        MDC.put("nodeId", id.toString());
+
+        long currentTerm = state.getCurrentTerm();
+        long requestTerm = request.getTerm();
+
+        // If request term > current term, update term
+        if (requestTerm > currentTerm) {
+            state.updateTerm(requestTerm);
+            currentTerm = requestTerm;
+            onBecomeFollower();
+        }
+
+        // Reject if request term < current term
+        if (requestTerm < currentTerm) {
+            return InstallSnapshotResponse.newBuilder()
+                    .setTerm(currentTerm)
+                    .build();
+        }
+
+        // Valid message from leader
+        state.setLeaderId(NodeId.of(request.getLeaderId()));
+        electionManager.resetElectionTimer();
+
+        // For simplicity, we assume the entire snapshot is sent in one request (done=true)
+        if (request.getDone()) {
+            try {
+                installSnapshot(
+                        request.getLastIncludedIndex(),
+                        request.getLastIncludedTerm(),
+                        request.getData().toByteArray()
+                );
+            } catch (IOException e) {
+                logger.error("Failed to install snapshot", e);
+            }
+        }
+
+        return InstallSnapshotResponse.newBuilder()
+                .setTerm(currentTerm)
                 .build();
     }
 
