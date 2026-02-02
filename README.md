@@ -89,7 +89,7 @@ src/main/java/com/raftdb/
 ### Build
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/raft-kv.git
+git clone https://github.com/wangpaopao-lei/raft-kv.git
 cd raft-kv
 mvn clean compile
 ```
