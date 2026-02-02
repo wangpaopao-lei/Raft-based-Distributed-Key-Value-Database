@@ -9,8 +9,8 @@ A distributed key-value database built from scratch, implementing the [Raft cons
 
 [![Javadoc](https://img.shields.io/badge/docs-Javadoc-blue.svg)](https://你的用户名.github.io/raft-kv/)
 ## Documentation
-- **[API Documentation (Javadoc)](https://你的用户名.github.io/raft-kv/)** - Comprehensive API reference
-- 
+- **[API Documentation (Javadoc)](https://wangpaopao-lei.github.io/Raft-based-Distributed-Key-Value-Database/)** - Comprehensive API reference
+
 ## Features
 
 - **Leader Election** - Randomized election timeout, split vote handling
