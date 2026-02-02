@@ -21,16 +21,52 @@ import java.util.function.Consumer;
 import java.util.function.Function;
 
 /**
- * Manages log replication from leader to followers.
+ * Manages log replication from the leader to all followers.
  *
- * Leader maintains for each follower:
- * - nextIndex: next log entry to send (initialized to leader's last log index + 1)
- * - matchIndex: highest log entry known to be replicated (initialized to 0)
+ * <p>This class implements the log replication mechanism described in the Raft paper.
+ * It is only active when this node is the leader. The manager handles:
+ * <ul>
+ *   <li>Sending AppendEntries RPCs to replicate log entries</li>
+ *   <li>Sending heartbeats to maintain leadership</li>
+ *   <li>Tracking replication progress for each follower</li>
+ *   <li>Advancing the commit index when entries are replicated to a majority</li>
+ *   <li>Sending snapshots to followers that are too far behind</li>
+ * </ul>
+ *
+ * <h2>Per-Follower State</h2>
+ * <p>The leader maintains two indices for each follower:
+ * <ul>
+ *   <li><b>nextIndex</b> - Index of the next log entry to send to that follower
+ *       (initialized to leader's last log index + 1)</li>
+ *   <li><b>matchIndex</b> - Index of the highest log entry known to be replicated
+ *       on that follower (initialized to 0)</li>
+ * </ul>
+ *
+ * <h2>Replication Flow</h2>
+ * <ol>
+ *   <li>Leader sends AppendEntries with entries starting at nextIndex</li>
+ *   <li>If successful, update nextIndex and matchIndex</li>
+ *   <li>If unsuccessful due to log inconsistency, decrement nextIndex and retry</li>
+ *   <li>If follower is too far behind (nextIndex &le; snapshotIndex), send snapshot</li>
+ *   <li>When matchIndex advances on a majority, advance commitIndex</li>
+ * </ol>
+ *
+ * <h2>Heartbeat</h2>
+ * <p>Empty AppendEntries RPCs are sent periodically (every 50ms) to:
+ * <ul>
+ *   <li>Prevent followers from starting elections</li>
+ *   <li>Propagate commit index updates</li>
+ * </ul>
+ *
+ * @author raft-kv
+ * @see LogManager
+ * @see com.raftdb.core.RaftNode
  */
 public class ReplicationManager {
 
     private static final Logger logger = LoggerFactory.getLogger(ReplicationManager.class);
 
+    /** Interval between replication/heartbeat rounds in milliseconds. */
     private static final long REPLICATION_INTERVAL_MS = 50;
 
     private final NodeId selfId;
@@ -39,11 +75,13 @@ public class ReplicationManager {
     private final RpcTransport transport;
     private final List<NodeId> peers;
 
-    // Per-follower replication state
+    /** Next log index to send to each follower. */
     private final Map<NodeId, Long> nextIndex = new ConcurrentHashMap<>();
+
+    /** Highest log index known to be replicated on each follower. */
     private final Map<NodeId, Long> matchIndex = new ConcurrentHashMap<>();
 
-    // Peers currently receiving a snapshot (to avoid sending multiple snapshots concurrently)
+    /** Peers currently receiving a snapshot (to avoid concurrent snapshot transfers). */
     private final Set<NodeId> snapshotInProgress = ConcurrentHashMap.newKeySet();
 
     private final ScheduledExecutorService scheduler;
@@ -52,9 +90,18 @@ public class ReplicationManager {
     private Consumer<Long> onHigherTermDiscovered;
     private Runnable onCommitAdvanced;
 
-    // Snapshot provider: returns InstallSnapshotRequest for a peer, or null if no snapshot available
+    /** Provider for snapshot data when a follower needs to be brought up to date. */
     private Function<NodeId, InstallSnapshotRequest> snapshotProvider;
 
+    /**
+     * Constructs a new ReplicationManager.
+     *
+     * @param selfId the ID of this node
+     * @param state the Raft state object
+     * @param logManager the log manager
+     * @param transport the RPC transport for sending requests
+     * @param peers the list of peer node IDs
+     */
     public ReplicationManager(
             NodeId selfId,
             RaftState state,
@@ -73,21 +120,37 @@ public class ReplicationManager {
         });
     }
 
+    /**
+     * Sets the callback to invoke when a higher term is discovered from a follower.
+     *
+     * @param callback the callback receiving the higher term value
+     */
     public void setOnHigherTermDiscovered(Consumer<Long> callback) {
         this.onHigherTermDiscovered = callback;
     }
 
+    /**
+     * Sets the callback to invoke when the commit index advances.
+     *
+     * @param callback the callback to invoke
+     */
     public void setOnCommitAdvanced(Runnable callback) {
         this.onCommitAdvanced = callback;
     }
 
+    /**
+     * Sets the provider for creating InstallSnapshot requests.
+     *
+     * @param provider function that returns a snapshot request for a given peer,
+     *                 or null if no snapshot is available
+     */
     public void setSnapshotProvider(Function<NodeId, InstallSnapshotRequest> provider) {
         this.snapshotProvider = provider;
     }
 
     /**
-     * Start replication. Called when becoming leader.
-     * Initialize nextIndex and matchIndex for all followers.
+     * Starts replication. Called when becoming leader.
+     * Initializes nextIndex and matchIndex for all followers.
      */
     public void start() {
         MDC.put("nodeId", selfId.toString());

@@ -7,11 +7,42 @@ import java.io.*;
 import java.nio.file.*;
 
 /**
- * Manages snapshot persistence.
+ * Manages snapshot persistence for log compaction.
  *
- * Files:
- * - snapshot.dat: Raw snapshot data (KV state)
- * - snapshot.meta: Metadata (lastIncludedIndex, lastIncludedTerm)
+ * <p>Snapshots capture the state machine's state at a specific point in time,
+ * allowing log entries up to that point to be discarded. This bounds the log
+ * size and enables fast recovery for nodes that fall far behind.
+ *
+ * <h2>Snapshot Files</h2>
+ * <ul>
+ *   <li><b>snapshot.dat</b> - Raw snapshot data (serialized state machine state)</li>
+ *   <li><b>snapshot.meta</b> - Metadata containing:
+ *       <ul>
+ *         <li>{@code lastIncludedIndex} - Index of the last log entry in the snapshot</li>
+ *         <li>{@code lastIncludedTerm} - Term of the last log entry in the snapshot</li>
+ *       </ul>
+ *   </li>
+ * </ul>
+ *
+ * <h2>Atomic Writes</h2>
+ * <p>Snapshots are saved atomically using the write-to-temp-then-rename pattern:
+ * <ol>
+ *   <li>Write data to temporary files (snapshot.dat.tmp, snapshot.meta.tmp)</li>
+ *   <li>Fsync both files to ensure durability</li>
+ *   <li>Atomically rename temp files to final names</li>
+ * </ol>
+ * <p>This ensures that even a crash during snapshot save won't corrupt existing data.
+ *
+ * <h2>Usage</h2>
+ * <p>The SnapshotManager is used in two scenarios:
+ * <ul>
+ *   <li><b>Taking snapshots</b> - Leader periodically snapshots state machine to compact log</li>
+ *   <li><b>Installing snapshots</b> - Follower receives snapshot via InstallSnapshot RPC</li>
+ * </ul>
+ *
+ * @author raft-kv
+ * @see com.raftdb.statemachine.StateMachine#takeSnapshot()
+ * @see com.raftdb.statemachine.StateMachine#restoreSnapshot(byte[])
  */
 public class SnapshotManager {
 
@@ -24,10 +55,21 @@ public class SnapshotManager {
     private final Path snapshotFile;
     private final Path metaFile;
 
-    // Cached metadata
+    /** Index of the last log entry included in the snapshot. */
     private volatile long lastIncludedIndex = 0;
+
+    /** Term of the last log entry included in the snapshot. */
     private volatile long lastIncludedTerm = 0;
 
+    /**
+     * Constructs a new SnapshotManager for the given data directory.
+     *
+     * <p>Creates the directory if it doesn't exist and loads any existing
+     * snapshot metadata.
+     *
+     * @param dataDir the directory where snapshot files will be stored
+     * @throws IOException if initialization fails
+     */
     public SnapshotManager(Path dataDir) throws IOException {
         this.dataDir = dataDir;
         this.snapshotFile = dataDir.resolve(SNAPSHOT_FILE);
@@ -40,7 +82,12 @@ public class SnapshotManager {
     }
 
     /**
-     * Save a snapshot with its metadata.
+     * Saves a snapshot with its metadata atomically.
+     *
+     * @param data the serialized state machine data
+     * @param lastIndex the index of the last log entry included in this snapshot
+     * @param lastTerm the term of the last log entry included in this snapshot
+     * @throws IOException if saving fails
      */
     public synchronized void saveSnapshot(byte[] data, long lastIndex, long lastTerm) throws IOException {
         // Write snapshot data to temp file first

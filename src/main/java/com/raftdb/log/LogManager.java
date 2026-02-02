@@ -12,11 +12,35 @@ import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
- * Manages the Raft log.
+ * Manages the replicated log for a Raft node.
  *
- * Thread-safe implementation using read-write locks.
- * Supports optional persistence via PersistenceManager.
- * Supports log compaction via snapshots.
+ * <p>The log is the core data structure in Raft that maintains the sequence of
+ * commands to be applied to the state machine. This class provides thread-safe
+ * operations for appending, querying, and truncating log entries.
+ *
+ * <h2>Key Features</h2>
+ * <ul>
+ *   <li><b>Thread Safety</b> - Uses read-write locks for concurrent access</li>
+ *   <li><b>Persistence</b> - Optional durable storage via {@link PersistenceManager}</li>
+ *   <li><b>Log Compaction</b> - Supports snapshot-based compaction to bound log growth</li>
+ *   <li><b>1-Indexed</b> - Log indices start at 1 (index 0 is unused)</li>
+ * </ul>
+ *
+ * <h2>Log Compaction</h2>
+ * <p>When a snapshot is taken, log entries up to the snapshot index are discarded.
+ * The {@code snapshotIndex} and {@code snapshotTerm} track the last entry included
+ * in the snapshot. Queries for compacted entries return information from the
+ * snapshot metadata.
+ *
+ * <h2>Index Translation</h2>
+ * <p>After compaction, log indices must be translated to array positions:
+ * <pre>
+ * arrayIndex = logIndex - snapshotIndex
+ * </pre>
+ *
+ * @author raft-kv
+ * @see LogEntry
+ * @see PersistenceManager
  */
 public class LogManager {
 
@@ -34,13 +58,25 @@ public class LogManager {
     private volatile long snapshotIndex = 0;
     private volatile long snapshotTerm = 0;
 
+    /**
+     * Constructs a new empty log manager.
+     *
+     * <p>The log is initialized with a dummy entry at index 0 to maintain
+     * 1-indexed semantics.
+     */
     public LogManager() {
         // Add dummy entry at index 0 to make log 1-indexed
         entries.add(null);
     }
 
     /**
-     * Set persistence manager and load existing logs.
+     * Sets the persistence manager and loads existing log entries from disk.
+     *
+     * <p>This method should be called during node startup to recover the
+     * persisted log state.
+     *
+     * @param persistence the persistence manager to use
+     * @throws IOException if an I/O error occurs while loading logs
      */
     public void setPersistence(PersistenceManager persistence) throws IOException {
         this.persistence = persistence;
@@ -59,8 +95,14 @@ public class LogManager {
     }
 
     /**
-     * Set snapshot info after loading/installing a snapshot.
-     * Also clears any log entries before or at the snapshot index.
+     * Sets the snapshot metadata after loading or installing a snapshot.
+     *
+     * <p>This method updates the snapshot index and term, and removes any log
+     * entries that are now covered by the snapshot (i.e., entries at or before
+     * the snapshot index).
+     *
+     * @param index the index of the last entry included in the snapshot
+     * @param term the term of the last entry included in the snapshot
      */
     public void setSnapshot(long index, long term) {
         lock.writeLock().lock();
@@ -92,7 +134,9 @@ public class LogManager {
     }
 
     /**
-     * Get the log offset (entries before this are compacted into snapshot).
+     * Returns the log offset (entries before this index are compacted).
+     *
+     * @return the snapshot index
      */
     private long getLogOffset() {
         return snapshotIndex;

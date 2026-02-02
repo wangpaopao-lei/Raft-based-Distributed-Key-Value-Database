@@ -6,7 +6,12 @@
 
 A distributed key-value database built from scratch, implementing the [Raft consensus algorithm](https://raft.github.io/) in Java.
 
-## ✨ Features
+
+[![Javadoc](https://img.shields.io/badge/docs-Javadoc-blue.svg)](https://你的用户名.github.io/raft-kv/)
+## Documentation
+- **[API Documentation (Javadoc)](https://你的用户名.github.io/raft-kv/)** - Comprehensive API reference
+- 
+## Features
 
 - **Leader Election** - Randomized election timeout, split vote handling
 - **Log Replication** - Consistency check, conflict resolution, fast rollback optimization
@@ -14,7 +19,7 @@ A distributed key-value database built from scratch, implementing the [Raft cons
 - **Snapshot** - Log compaction with state machine snapshots and snapshot-based recovery
 - **Strong Consistency** - Linearizable writes via Raft consensus
 
-## 🏗️ Architecture
+## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -42,7 +47,7 @@ A distributed key-value database built from scratch, implementing the [Raft cons
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-## 📁 Project Structure
+## Project Structure
 
 ```
 src/main/java/com/raftdb/
@@ -79,7 +84,7 @@ src/main/java/com/raftdb/
     └── LocalTransport.java   # In-memory transport for testing
 ```
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Prerequisites
 
@@ -194,7 +199,7 @@ byte[] value = leader.read("name".getBytes());
 System.out.println(new String(value));  // "raft-kv"
 ```
 
-## 🔬 Raft Implementation Details
+## Raft Implementation Details
 
 ### Leader Election
 
@@ -230,7 +235,7 @@ data/node-1/
 - **Process**: Serialize StateMachine → Save to disk → Compact log
 - **InstallSnapshot RPC**: Leader sends snapshot to far-behind followers
 
-## 📊 Test Coverage
+## Test Coverage
 
 | Component | Tests |
 |-----------|-------|
@@ -244,7 +249,7 @@ Run all tests:
 mvn test
 ```
 
-## 🗺️ Roadmap
+## Roadmap
 
 - [x] **Phase 1**: Leader Election
 - [x] **Phase 2**: Log Replication
@@ -254,17 +259,17 @@ mvn test
 - [ ] **Phase 6**: Client API & CLI
 - [ ] **Phase 7**: Linearizable Reads
 
-## 📚 References
+## References
 
 - [Raft Paper](https://raft.github.io/raft.pdf) - In Search of an Understandable Consensus Algorithm
 - [Raft Visualization](https://raft.github.io/) - Interactive Raft visualization
 - [Students' Guide to Raft](https://thesquareplanet.com/blog/students-guide-to-raft/) - Common implementation pitfalls
 
-## 📄 License
+## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-## 🙏 Acknowledgments
+## Acknowledgments
 
 - Diego Ongaro and John Ousterhout for the Raft algorithm
 - The etcd and TiKV projects for implementation inspiration

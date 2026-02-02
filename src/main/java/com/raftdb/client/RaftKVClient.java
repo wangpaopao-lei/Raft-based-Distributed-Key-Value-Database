@@ -14,21 +14,35 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Client SDK for interacting with a Raft KV cluster.
+ * Client SDK for interacting with a Raft-KV distributed key-value cluster.
  *
- * Features:
- * - Automatic leader discovery and redirect handling
- * - Retry on failures
- * - Connection pooling
+ * <p>This client provides a simple interface for performing key-value operations
+ * against a Raft cluster. It handles the complexities of distributed systems
+ * including leader discovery, automatic retries, and failover.
  *
- * Usage:
- * <pre>
- *   try (RaftKVClient client = RaftKVClient.connect("localhost:9001,localhost:9002,localhost:9003")) {
- *       client.put("key", "value");
- *       String value = client.get("key");
- *       client.delete("key");
- *   }
- * </pre>
+ * <h2>Key Features</h2>
+ * <ul>
+ *   <li><b>Automatic Leader Discovery</b> - Automatically finds and connects to the leader</li>
+ *   <li><b>Transparent Redirects</b> - Handles "not leader" responses by switching servers</li>
+ *   <li><b>Retry on Failure</b> - Retries operations on transient failures</li>
+ *   <li><b>Connection Pooling</b> - Reuses gRPC connections for efficiency</li>
+ *   <li><b>Thread Safety</b> - Safe for concurrent use from multiple threads</li>
+ * </ul>
+ *
+ * <h2>Usage Example</h2>
+ * <pre>{@code
+ * try (RaftKVClient client = RaftKVClient.connect("localhost:9001,localhost:9002,localhost:9003")) {
+ *     client.put("user:123", "Alice");
+ *     String name = client.get("user:123");  // "Alice"
+ *     client.delete("user:123");
+ * }
+ * }</pre>
+ *
+ * <h2>Error Handling</h2>
+ * <p>Operations throw {@link RaftClientException} if they fail after all retries.
+ *
+ * @author raft-kv
+ * @see RaftCli
  */
 public class RaftKVClient implements Closeable {
 
@@ -44,6 +58,12 @@ public class RaftKVClient implements Closeable {
     private volatile String leaderAddress;
     private final java.util.concurrent.atomic.AtomicInteger currentServerIndex = new java.util.concurrent.atomic.AtomicInteger(0);
 
+    /**
+     * Constructs a client with the given server addresses.
+     *
+     * @param serverAddresses list of server addresses in host:port format
+     * @throws IllegalArgumentException if the address list is empty
+     */
     private RaftKVClient(List<String> serverAddresses) {
         this.serverAddresses = new ArrayList<>(serverAddresses);
         if (serverAddresses.isEmpty()) {
@@ -53,9 +73,10 @@ public class RaftKVClient implements Closeable {
     }
 
     /**
-     * Connect to a Raft cluster.
+     * Creates a client connected to a Raft cluster.
      *
-     * @param addresses comma-separated list of server addresses (host:port)
+     * @param addresses comma-separated list of server addresses (e.g., "host1:9001,host2:9002")
+     * @return a new client instance
      */
     public static RaftKVClient connect(String addresses) {
         String[] parts = addresses.split(",");
@@ -63,9 +84,10 @@ public class RaftKVClient implements Closeable {
     }
 
     /**
-     * Connect to a Raft cluster.
+     * Creates a client connected to a Raft cluster.
      *
-     * @param addresses list of server addresses (host:port)
+     * @param addresses list of server addresses in host:port format
+     * @return a new client instance
      */
     public static RaftKVClient connect(List<String> addresses) {
         return new RaftKVClient(addresses);

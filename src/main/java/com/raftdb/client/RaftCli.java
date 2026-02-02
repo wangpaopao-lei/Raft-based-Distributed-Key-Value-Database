@@ -4,17 +4,58 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Command-line interface for Raft KV operations.
+ * Command-line interface for interacting with a Raft-KV cluster.
  *
- * Usage:
- *   raft-cli --cluster=localhost:9001,localhost:9002,localhost:9003 put mykey myvalue
- *   raft-cli --cluster=localhost:9001,localhost:9002,localhost:9003 get mykey
- *   raft-cli --cluster=localhost:9001,localhost:9002,localhost:9003 delete mykey
+ * <p>This tool provides a simple way to perform key-value operations from
+ * the command line. It connects to the cluster, automatically discovers
+ * the leader, and executes the requested operation.
+ *
+ * <h2>Usage</h2>
+ * <pre>{@code
+ * # Store a value
+ * raft-cli --cluster=localhost:9001,localhost:9002,localhost:9003 put mykey myvalue
+ *
+ * # Retrieve a value
+ * raft-cli --cluster=localhost:9001,localhost:9002,localhost:9003 get mykey
+ *
+ * # Delete a value
+ * raft-cli --cluster=localhost:9001,localhost:9002,localhost:9003 delete mykey
+ *
+ * # Show help
+ * raft-cli help
+ * }</pre>
+ *
+ * <h2>Options</h2>
+ * <ul>
+ *   <li><b>--cluster, -c</b> - Comma-separated list of server addresses (required)</li>
+ * </ul>
+ *
+ * <h2>Commands</h2>
+ * <ul>
+ *   <li><b>put &lt;key&gt; &lt;value&gt;</b> - Store a key-value pair</li>
+ *   <li><b>get &lt;key&gt;</b> - Retrieve the value for a key</li>
+ *   <li><b>delete &lt;key&gt;</b> - Delete a key-value pair</li>
+ *   <li><b>help</b> - Show usage information</li>
+ * </ul>
+ *
+ * <h2>Exit Codes</h2>
+ * <ul>
+ *   <li><b>0</b> - Success</li>
+ *   <li><b>1</b> - Error (invalid arguments, connection failure, etc.)</li>
+ * </ul>
+ *
+ * @author raft-kv
+ * @see RaftKVClient
  */
 public class RaftCli {
 
     private static final Logger logger = LoggerFactory.getLogger(RaftCli.class);
 
+    /**
+     * Main entry point for the CLI.
+     *
+     * @param args command line arguments
+     */
     public static void main(String[] args) {
         if (args.length < 2) {
             printUsage();
