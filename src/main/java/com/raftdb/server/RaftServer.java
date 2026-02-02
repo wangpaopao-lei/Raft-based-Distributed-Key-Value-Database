@@ -12,7 +12,7 @@ import java.nio.file.Paths;
 /**
  * Raft server main class.
  *
- * Starts a single Raft node with gRPC transport.
+ * Starts a single Raft node with gRPC transport and KV service.
  *
  * Usage:
  *   java -jar raft-kv.jar --id=node-1 --port=9001 \
@@ -26,6 +26,7 @@ public class RaftServer {
     private final NodeConfig config;
     private RaftNode raftNode;
     private GrpcTransport transport;
+    private KVServiceImpl kvService;
 
     public RaftServer(NodeConfig config) {
         this.config = config;
@@ -48,7 +49,7 @@ public class RaftServer {
         // Create data directory path
         Path dataDir = Paths.get(config.getDataDir(), config.getNodeId().id());
 
-        // Create and start Raft node
+        // Create Raft node (don't start yet)
         raftNode = new RaftNode(
                 config.getNodeId(),
                 config.getPeers(),
@@ -56,7 +57,14 @@ public class RaftServer {
                 dataDir
         );
 
-        raftNode.start();
+        // Create KV service
+        kvService = new KVServiceImpl(raftNode);
+
+        // Start transport with KV service
+        transport.start(raftNode, kvService);
+
+        // Initialize Raft node (election timer, persistence recovery, etc.)
+        raftNode.initialize();
 
         logger.info("Raft server started: {} listening on port {}",
                 config.getNodeId(), config.getPort());

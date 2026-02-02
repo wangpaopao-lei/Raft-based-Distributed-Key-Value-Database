@@ -133,11 +133,27 @@ public class RaftNode implements RpcHandler {
     }
 
     /**
-     * Start the Raft node.
+     * Start the Raft node (full startup including transport).
+     * Use this when transport is managed by RaftNode.
      */
     public void start() {
         MDC.put("nodeId", id.toString());
         logger.info("Starting RaftNode {}", id);
+
+        // Start transport
+        transport.start(this);
+
+        // Initialize persistence and election
+        initialize();
+    }
+
+    /**
+     * Initialize the Raft node (persistence recovery, election timer).
+     * Use this when transport is started separately (e.g., by RaftServer with KVService).
+     */
+    public void initialize() {
+        MDC.put("nodeId", id.toString());
+        logger.info("Initializing RaftNode {}", id);
 
         // Initialize persistence and recover state
         if (persistence != null) {
@@ -188,10 +204,10 @@ public class RaftNode implements RpcHandler {
             }
         }
 
-        transport.start(this);
+        // Start election timer
         electionManager.start();
 
-        logger.info("RaftNode {} started as FOLLOWER", id);
+        logger.info("RaftNode {} initialized as FOLLOWER", id);
     }
 
     /**

@@ -89,9 +89,9 @@ src/main/java/com/raftdb/
 ### Build
 
 ```bash
-git clone https://github.com/wangpaopao-lei/raft-kv.git
+git clone https://github.com/YOUR_USERNAME/raft-kv.git
 cd raft-kv
-mvn clean compile
+mvn clean package -DskipTests
 ```
 
 ### Run Tests
@@ -100,42 +100,94 @@ mvn clean compile
 mvn test
 ```
 
-### Example Usage
+### Start a Cluster
+
+Start a 3-node cluster in separate terminals:
+
+```bash
+# Terminal 1
+java --enable-preview -jar target/raft-kv-1.0-SNAPSHOT.jar \
+  --id=node-1 --port=9001 \
+  --peers=node-2:localhost:9002,node-3:localhost:9003
+
+# Terminal 2
+java --enable-preview -jar target/raft-kv-1.0-SNAPSHOT.jar \
+  --id=node-2 --port=9002 \
+  --peers=node-1:localhost:9001,node-3:localhost:9003
+
+# Terminal 3
+java --enable-preview -jar target/raft-kv-1.0-SNAPSHOT.jar \
+  --id=node-3 --port=9003 \
+  --peers=node-1:localhost:9001,node-2:localhost:9002
+```
+
+### Use the CLI
+
+```bash
+# Put a value
+java -cp target/raft-kv-1.0-SNAPSHOT.jar com.raftdb.client.RaftCli \
+  --cluster=localhost:9001,localhost:9002,localhost:9003 put mykey myvalue
+
+# Get a value
+java -cp target/raft-kv-1.0-SNAPSHOT.jar com.raftdb.client.RaftCli \
+  --cluster=localhost:9001,localhost:9002,localhost:9003 get mykey
+
+# Delete a key
+java -cp target/raft-kv-1.0-SNAPSHOT.jar com.raftdb.client.RaftCli \
+  --cluster=localhost:9001,localhost:9002,localhost:9003 delete mykey
+```
+
+### Use the Java Client SDK
+
+```java
+try (RaftKVClient client = RaftKVClient.connect("localhost:9001,localhost:9002,localhost:9003")) {
+    // Put
+    client.put("name", "Alice");
+    
+    // Get
+    String value = client.get("name");  // "Alice"
+    
+    // Delete
+    client.delete("name");
+}
+```
+
+### Programmatic Usage (In-Process)
 
 ```java
 // Create a 3-node cluster
 List<NodeId> nodeIds = List.of(
-    NodeId.of("node-1"),
-    NodeId.of("node-2"),
-    NodeId.of("node-3")
-);
+                NodeId.of("node-1"),
+                NodeId.of("node-2"),
+                NodeId.of("node-3")
+        );
 
 // Create nodes with persistence
 List<RaftNode> nodes = new ArrayList<>();
 for (NodeId id : nodeIds) {
-    List<NodeId> peers = nodeIds.stream()
+List<NodeId> peers = nodeIds.stream()
         .filter(n -> !n.equals(id))
         .toList();
-    
-    RaftNode node = new RaftNode(
-        id, 
-        peers, 
+
+RaftNode node = new RaftNode(
+        id,
+        peers,
         new LocalTransport(id),
         Paths.get("data", id.id())  // persistence directory
-    );
+);
     node.start();
     nodes.add(node);
 }
 
 // Wait for leader election
 RaftNode leader = nodes.stream()
-    .filter(RaftNode::isLeader)
-    .findFirst()
-    .orElseThrow();
+        .filter(RaftNode::isLeader)
+        .findFirst()
+        .orElseThrow();
 
 // Write data (goes through Raft consensus)
 leader.submitCommand(Command.put("name", "raft-kv"))
-    .get(5, TimeUnit.SECONDS);
+        .get(5, TimeUnit.SECONDS);
 
 // Read data
 byte[] value = leader.read("name".getBytes());
@@ -195,7 +247,7 @@ mvn test
 ## 🗺️ Roadmap
 
 - [x] **Phase 1**: Leader Election
-- [x] **Phase 2**: Log Replication  
+- [x] **Phase 2**: Log Replication
 - [x] **Phase 3**: Persistence & Recovery
 - [x] **Phase 4**: Snapshot & Log Compaction
 - [ ] **Phase 5**: gRPC Network Transport

@@ -78,6 +78,30 @@ public class GrpcTransport implements RpcTransport {
         }
     }
 
+    /**
+     * Start with additional gRPC services (e.g., KVService).
+     */
+    public void start(RpcHandler handler, io.grpc.BindableService... additionalServices) {
+        this.handler = handler;
+
+        try {
+            ServerBuilder<?> builder = ServerBuilder.forPort(port)
+                    .addService(new RaftServiceImpl());
+
+            for (io.grpc.BindableService service : additionalServices) {
+                builder.addService(service);
+            }
+
+            server = builder.build().start();
+
+            logger.info("gRPC server started on {}:{} with {} additional services",
+                    host, port, additionalServices.length);
+
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to start gRPC server on port " + port, e);
+        }
+    }
+
     @Override
     public void shutdown() {
         // Shutdown all client channels
