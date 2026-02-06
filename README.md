@@ -21,30 +21,44 @@ A distributed key-value database built from scratch, implementing the [Raft cons
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                           RaftNode                              │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────┐  │
-│  │   State     │  │    Log      │  │      StateMachine       │  │
-│  │  (term,     │  │  (entries,  │  │  ┌─────────────────┐    │  │
-│  │   role,     │  │   index)    │  │  │ SkipListKVStore │    │  │
-│  │   votedFor) │  │             │  │  └─────────────────┘    │  │
-│  └─────────────┘  └─────────────┘  └─────────────────────────┘  │
-│         │                │                      │               │
-│  ┌──────┴────────────────┴──────────────────────┴────────────┐  │
-│  │                   PersistenceManager                      │  │
-│  │              (meta.dat, log.dat, snapshot.*)              │  │
-│  └───────────────────────────────────────────────────────────┘  │
-│                              │                                  │
-│  ┌───────────────────────────┴───────────────────────────────┐  │
-│  │  ElectionManager  │  ReplicationManager  │ SnapshotManager│  │
-│  └───────────────────────────────────────────────────────────┘  │
-│                              │                                  │
-│  ┌───────────────────────────┴───────────────────────────────┐  │
-│  │                      RpcTransport                         │  │
-│  │              (LocalTransport / GrpcTransport)             │  │
-│  └───────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph RaftNode
+        direction TB
+
+        subgraph CoreState["Core State"]
+            direction LR
+            State["State<br/>(term, role,<br/>votedFor)"]
+            Log["Log<br/>(entries,<br/>index)"]
+
+            subgraph StateMachine["StateMachine"]
+                SkipListKVStore["SkipListKVStore"]
+            end
+        end
+
+        PersistenceManager["PersistenceManager<br/>(meta.dat,<br/>log.dat,<br/>snapshot.*)"]
+
+        subgraph Managers["Managers"]
+            direction LR
+            ElectionManager
+            ReplicationManager
+            SnapshotManager
+        end
+
+        RpcTransport["RpcTransport<br/>(LocalTransport / GrpcTransport)"]
+
+        State --> PersistenceManager
+        Log --> PersistenceManager
+        StateMachine --> PersistenceManager
+
+        PersistenceManager --> ElectionManager
+        PersistenceManager --> ReplicationManager
+        PersistenceManager --> SnapshotManager
+
+        ElectionManager --> RpcTransport
+        ReplicationManager --> RpcTransport
+        SnapshotManager --> RpcTransport
+    end
 ```
 
 ## Project Structure
