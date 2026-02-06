@@ -17,6 +17,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.function.Function;
 
@@ -405,6 +407,102 @@ public class ReplicationManager {
                 break;
             }
         }
+    }
+
+    /**
+     * Confirms that this node is still the leader by sending heartbeats to all peers
+     * and waiting for responses from a majority.
+     *
+     * <p>This is used for linearizable reads to ensure the leader hasn't been
+     * superseded by another leader. The method sends empty AppendEntries (heartbeats)
+     * to all peers and waits for acknowledgments from a majority.
+     *
+     * @param timeoutMs maximum time to wait for confirmation in milliseconds
+     * @return a CompletableFuture that completes with true if leadership is confirmed,
+     *         false if not enough peers responded or a higher term was discovered
+     */
+    public CompletableFuture<Boolean> confirmLeadership(long timeoutMs) {
+        if (!state.isLeader()) {
+            return CompletableFuture.completedFuture(false);
+        }
+
+        // Single node cluster: always confirmed
+        if (peers.isEmpty()) {
+            return CompletableFuture.completedFuture(true);
+        }
+
+        CompletableFuture<Boolean> result = new CompletableFuture<>();
+
+        // We need majority including self: (N+1)/2 + 1 total, so (N+1)/2 from peers
+        int needed = (peers.size() + 1) / 2;
+        AtomicInteger successCount = new AtomicInteger(0);
+        AtomicInteger failureCount = new AtomicInteger(0);
+        AtomicBoolean completed = new AtomicBoolean(false);
+
+        long term = state.getCurrentTerm();
+
+        // Send heartbeat to all peers
+        for (NodeId peer : peers) {
+            long prevLogIndex = nextIndex.getOrDefault(peer, 1L) - 1;
+            long prevLogTerm = logManager.getTerm(prevLogIndex);
+
+            AppendEntriesRequest request = AppendEntriesRequest.newBuilder()
+                    .setTerm(term)
+                    .setLeaderId(selfId.toString())
+                    .setPrevLogIndex(prevLogIndex)
+                    .setPrevLogTerm(prevLogTerm)
+                    .setLeaderCommit(state.getCommitIndex())
+                    .build();
+
+            transport.sendAppendEntries(peer, request)
+                    .orTimeout(timeoutMs, TimeUnit.MILLISECONDS)
+                    .whenComplete((response, error) -> {
+                        if (completed.get()) {
+                            return;
+                        }
+
+                        if (error != null) {
+                            int failures = failureCount.incrementAndGet();
+                            // Too many failures, cannot reach majority
+                            if (failures > peers.size() - needed) {
+                                if (completed.compareAndSet(false, true)) {
+                                    result.complete(false);
+                                }
+                            }
+                            return;
+                        }
+
+                        // Check for higher term
+                        if (response.getTerm() > term) {
+                            if (onHigherTermDiscovered != null) {
+                                onHigherTermDiscovered.accept(response.getTerm());
+                            }
+                            if (completed.compareAndSet(false, true)) {
+                                result.complete(false);
+                            }
+                            return;
+                        }
+
+                        // Count success (even if log check failed, the peer acknowledged our term)
+                        int successes = successCount.incrementAndGet();
+                        if (successes >= needed) {
+                            if (completed.compareAndSet(false, true)) {
+                                logger.debug("Leadership confirmed with {}/{} peer responses", successes, peers.size());
+                                result.complete(true);
+                            }
+                        }
+                    });
+        }
+
+        // Timeout handler
+        scheduler.schedule(() -> {
+            if (completed.compareAndSet(false, true)) {
+                logger.debug("Leadership confirmation timed out");
+                result.complete(false);
+            }
+        }, timeoutMs, TimeUnit.MILLISECONDS);
+
+        return result;
     }
 
     /**

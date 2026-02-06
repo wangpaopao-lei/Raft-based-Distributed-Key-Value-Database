@@ -30,15 +30,58 @@ import java.util.concurrent.*;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * Main Raft node implementation.
+ * The main Raft consensus node implementation.
  *
- * Assembles all components and coordinates their interactions.
+ * <p>This class is the central component that coordinates all parts of the Raft
+ * algorithm. It assembles and manages:
+ * <ul>
+ *   <li>{@link RaftState} - Persistent and volatile node state</li>
+ *   <li>{@link LogManager} - Replicated log storage</li>
+ *   <li>{@link ElectionManager} - Leader election process</li>
+ *   <li>{@link ReplicationManager} - Log replication to followers</li>
+ *   <li>{@link StateMachine} - Application state (key-value store)</li>
+ *   <li>{@link PersistenceManager} - Durable storage for crash recovery</li>
+ *   <li>{@link SnapshotManager} - Log compaction via snapshots</li>
+ * </ul>
+ *
+ * <h2>Node Lifecycle</h2>
+ * <ol>
+ *   <li>Create node with {@link #RaftNode(NodeId, List, RpcTransport)} or
+ *       {@link #RaftNode(NodeId, List, RpcTransport, Path)}</li>
+ *   <li>Start node with {@link #start()} - begins election timer and accepts RPCs</li>
+ *   <li>Submit commands with {@link #submitCommand(Command)} - only succeeds on leader</li>
+ *   <li>Stop node with {@link #stop()} - graceful shutdown</li>
+ * </ol>
+ *
+ * <h2>Client Interaction</h2>
+ * <p>Clients submit commands to the leader via {@link #submitCommand(Command)}.
+ * The method returns a {@link CompletableFuture} that completes when the command
+ * is committed and applied. If this node is not the leader, use {@link #getLeaderId()}
+ * to redirect the client.
+ *
+ * <h2>RPC Handling</h2>
+ * <p>This class implements {@link RpcHandler} to process incoming Raft RPCs:
+ * <ul>
+ *   <li>{@link #handleVoteRequest(VoteRequest)} - Process vote requests from candidates</li>
+ *   <li>{@link #handleAppendEntries(AppendEntriesRequest)} - Process log replication/heartbeats</li>
+ *   <li>{@link #handleInstallSnapshot(InstallSnapshotRequest)} - Process snapshot transfers</li>
+ * </ul>
+ *
+ * <h2>Thread Safety</h2>
+ * <p>This class is thread-safe. Internal locks protect log append operations
+ * and snapshot creation to ensure consistency.
+ *
+ * @author raft-kv
+ * @see RaftState
+ * @see LogManager
+ * @see ElectionManager
+ * @see ReplicationManager
  */
 public class RaftNode implements RpcHandler {
 
     private static final Logger logger = LoggerFactory.getLogger(RaftNode.class);
 
-    // Snapshot threshold: take snapshot when log exceeds this many entries
+    /** Threshold for triggering automatic snapshot creation. */
     private static final int SNAPSHOT_THRESHOLD = 1000;
 
     private final NodeId id;
@@ -56,23 +99,27 @@ public class RaftNode implements RpcHandler {
     // Optional snapshot manager
     private SnapshotManager snapshotManager;
 
-    // Pending client requests waiting for commit
+    /** Pending client requests waiting for commit, keyed by log index. */
     private final Map<Long, CompletableFuture<byte[]>> pendingRequests = new ConcurrentHashMap<>();
 
-    // Lock for log append operations
+    /** Lock for serializing log append operations. */
     private final ReentrantLock appendLock = new ReentrantLock();
 
-    // Lock for snapshot operations
+    /** Lock for serializing snapshot operations. */
     private final ReentrantLock snapshotLock = new ReentrantLock();
 
-    // Executor for applying committed entries
+    /** Executor for applying committed entries to the state machine. */
     private final ExecutorService applyExecutor;
 
-    // Data directory for persistence
+    /** Data directory for persistence (null if persistence disabled). */
     private final Path dataDir;
 
     /**
-     * Create a RaftNode without persistence (for testing).
+     * Creates a RaftNode without persistence (for testing).
+     *
+     * @param id this node's unique identifier
+     * @param peers list of peer node IDs in the cluster
+     * @param transport the RPC transport for communication
      */
     public RaftNode(NodeId id, List<NodeId> peers, RpcTransport transport) {
         this(id, peers, transport, null);
@@ -323,6 +370,106 @@ public class RaftNode implements RpcHandler {
      */
     public byte[] read(byte[] key) {
         return stateMachine.get(key);
+    }
+
+    /**
+     * Performs a linearizable read of the given key.
+     *
+     * <p>This method implements the ReadIndex protocol to ensure the read
+     * returns data that reflects all writes committed before the read began.
+     * The steps are:
+     * <ol>
+     *   <li>Record the current commitIndex as readIndex</li>
+     *   <li>Confirm leadership by sending heartbeats to a majority</li>
+     *   <li>Wait until lastApplied &ge; readIndex</li>
+     *   <li>Read and return the value from the state machine</li>
+     * </ol>
+     *
+     * @param key the key to read
+     * @return a future that completes with the value, or null if key not found
+     * @throws NotLeaderException if this node is not the leader
+     */
+    public CompletableFuture<byte[]> linearizableRead(byte[] key) {
+        MDC.put("nodeId", id.toString());
+
+        if (!state.isLeader()) {
+            CompletableFuture<byte[]> future = new CompletableFuture<>();
+            future.completeExceptionally(new NotLeaderException(state.getLeaderId()));
+            return future;
+        }
+
+        // Step 1: Record readIndex = commitIndex
+        long readIndex = state.getCommitIndex();
+        logger.debug("Linearizable read starting, readIndex={}", readIndex);
+
+        // Step 2: Confirm leadership (send heartbeats, wait for majority)
+        return replicationManager.confirmLeadership(2000)
+                .thenCompose(confirmed -> {
+                    if (!confirmed) {
+                        CompletableFuture<Void> failed = new CompletableFuture<>();
+                        failed.completeExceptionally(
+                                new NotLeaderException(state.getLeaderId()));
+                        return failed;
+                    }
+
+                    // Step 3: Wait until lastApplied >= readIndex
+                    return waitForApplied(readIndex);
+                })
+                .thenApply(v -> {
+                    // Step 4: Read from state machine
+                    byte[] value = stateMachine.get(key);
+                    logger.debug("Linearizable read completed, key={}, found={}",
+                            new String(key), value != null);
+                    return value;
+                });
+    }
+
+    /**
+     * Waits until lastApplied reaches at least the specified index.
+     *
+     * @param index the index to wait for
+     * @return a future that completes when lastApplied >= index
+     */
+    private CompletableFuture<Void> waitForApplied(long index) {
+        CompletableFuture<Void> future = new CompletableFuture<>();
+
+        // If already applied, complete immediately
+        if (state.getLastApplied() >= index) {
+            future.complete(null);
+            return future;
+        }
+
+        // Otherwise, poll periodically
+        applyExecutor.execute(() -> {
+            long startTime = System.currentTimeMillis();
+            long timeoutMs = 5000;
+
+            while (state.getLastApplied() < index) {
+                if (System.currentTimeMillis() - startTime > timeoutMs) {
+                    future.completeExceptionally(
+                            new TimeoutException("Timed out waiting for apply"));
+                    return;
+                }
+
+                if (!state.isLeader()) {
+                    future.completeExceptionally(
+                            new NotLeaderException(state.getLeaderId()));
+                    return;
+                }
+
+                try {
+                    Thread.sleep(10); // Small sleep to avoid busy wait
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    future.completeExceptionally(e);
+                    return;
+                }
+            }
+
+            future.complete(null);
+        });
+
+        return future;
     }
 
     // ==================== Callbacks ====================

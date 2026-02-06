@@ -49,7 +49,9 @@ public class RaftKVClient implements Closeable {
     private static final Logger logger = LoggerFactory.getLogger(RaftKVClient.class);
 
     private static final int DEFAULT_TIMEOUT_SECONDS = 10;
-    private static final int MAX_RETRIES = 5;
+    private static final int MAX_RETRIES = 8;
+    private static final long INITIAL_RETRY_DELAY_MS = 50;
+    private static final long MAX_RETRY_DELAY_MS = 2000;
 
     private final List<String> serverAddresses;
     private final Map<String, ManagedChannel> channels = new ConcurrentHashMap<>();
@@ -134,6 +136,19 @@ public class RaftKVClient implements Closeable {
     }
 
     /**
+     * Get a value by key with linearizable consistency.
+     * This ensures the read reflects all committed writes.
+     *
+     * @param key the key
+     * @return the value, or null if not found
+     * @throws RaftClientException if the operation fails after retries
+     */
+    public String getLinearizable(String key) {
+        byte[] value = getBytesLinearizable(key.getBytes());
+        return value != null ? new String(value) : null;
+    }
+
+    /**
      * Get a value by key.
      *
      * @param key the key
@@ -144,6 +159,29 @@ public class RaftKVClient implements Closeable {
         ClientRequest request = ClientRequest.newBuilder()
                 .setOperation(OperationType.GET)
                 .setKey(ByteString.copyFrom(key))
+                .build();
+
+        ClientResponse response = executeWithRetry(request);
+
+        if (response.getValue().isEmpty()) {
+            return null;
+        }
+        return response.getValue().toByteArray();
+    }
+
+    /**
+     * Get a value by key with linearizable consistency.
+     * This ensures the read reflects all committed writes.
+     *
+     * @param key the key
+     * @return the value, or null if not found
+     * @throws RaftClientException if the operation fails after retries
+     */
+    public byte[] getBytesLinearizable(byte[] key) {
+        ClientRequest request = ClientRequest.newBuilder()
+                .setOperation(OperationType.GET)
+                .setKey(ByteString.copyFrom(key))
+                .setLinearizable(true)
                 .build();
 
         ClientResponse response = executeWithRetry(request);
@@ -208,6 +246,7 @@ public class RaftKVClient implements Closeable {
                     }
                     leaderAddress = getNextServer();
                     logger.debug("Switched to server: {}", leaderAddress);
+                    sleepWithBackoff(attempt);
                     continue;
                 }
 
@@ -221,16 +260,34 @@ public class RaftKVClient implements Closeable {
                 // Try next server
                 leaderAddress = getNextServer();
 
+                // Exponential backoff
+                sleepWithBackoff(attempt);
+
             } catch (RaftClientException e) {
                 throw e;
             } catch (Exception e) {
                 lastException = e;
                 logger.debug("Request to {} failed: {}", address, e.getMessage());
+
+                // Exponential backoff
+                sleepWithBackoff(attempt);
                 leaderAddress = getNextServer();
             }
         }
 
         throw new RaftClientException("Failed after " + MAX_RETRIES + " retries", lastException);
+    }
+
+    /**
+     * Sleep with exponential backoff.
+     */
+    private void sleepWithBackoff(int attempt) {
+        long delay = Math.min(INITIAL_RETRY_DELAY_MS * (1L << attempt), MAX_RETRY_DELAY_MS);
+        try {
+            Thread.sleep(delay);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     /**

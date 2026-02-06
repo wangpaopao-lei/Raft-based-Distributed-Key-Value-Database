@@ -234,6 +234,27 @@ data/node-1/
 - **Trigger**: When log exceeds threshold (default 1000 entries)
 - **Process**: Serialize StateMachine → Save to disk → Compact log
 - **InstallSnapshot RPC**: Leader sends snapshot to far-behind followers
+### Linearizable Reads (ReadIndex Protocol)
+
+Linearizable reads ensure clients always see the latest committed data:
+
+```
+Client         Leader                    Followers
+  |              |                           |
+  |--- GET ----->|                           |
+  |              |-- readIndex = commitIndex |
+  |              |                           |
+  |              |<-- heartbeat majority --->|
+  |              |                           |
+  |              |-- wait: applied >= readIndex
+  |              |                           |
+  |<-- value ----|                           |
+```
+
+- **Record readIndex**: Leader records current commitIndex
+- **Confirm Leadership**: Send heartbeats, wait for majority response
+- **Wait for Apply**: Ensure state machine has applied up to readIndex
+- **Read**: Return value from state machine
 
 ## Test Coverage
 
@@ -248,16 +269,6 @@ Run all tests:
 ```bash
 mvn test
 ```
-
-## Roadmap
-
-- [x] **Phase 1**: Leader Election
-- [x] **Phase 2**: Log Replication
-- [x] **Phase 3**: Persistence & Recovery
-- [x] **Phase 4**: Snapshot & Log Compaction
-- [ ] **Phase 5**: gRPC Network Transport
-- [ ] **Phase 6**: Client API & CLI
-- [ ] **Phase 7**: Linearizable Reads
 
 ## References
 
