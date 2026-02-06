@@ -252,7 +252,7 @@ data/node-1/
 
 Linearizable reads ensure clients always see the latest committed data:
 
-```mernaid
+```mermaid
 sequenceDiagram
     participant Client
     participant Leader
