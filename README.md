@@ -252,17 +252,22 @@ data/node-1/
 
 Linearizable reads ensure clients always see the latest committed data:
 
-```
-Client         Leader                    Followers
-  |              |                           |
-  |--- GET ----->|                           |
-  |              |-- readIndex = commitIndex |
-  |              |                           |
-  |              |<-- heartbeat majority --->|
-  |              |                           |
-  |              |-- wait: applied >= readIndex
-  |              |                           |
-  |<-- value ----|                           |
+```mernaid
+sequenceDiagram
+    participant Client
+    participant Leader
+    participant Followers
+
+    Client->>Leader: GET
+    Note right of Leader: readIndex = commitIndex
+
+    Leader->>Followers: Heartbeat (ReadIndex)
+    Followers-->>Leader: Ack (majority)
+
+    Note right of Leader: wait until applied >= readIndex
+
+    Leader-->>Client: value
+
 ```
 
 - **Record readIndex**: Leader records current commitIndex
